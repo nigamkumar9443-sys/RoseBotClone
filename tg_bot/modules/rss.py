@@ -1,0 +1,236 @@
+from telegram.constants import MessageLimit
+MAX_MESSAGE_LENGTH = MessageLimit.MAX_TEXT_LENGTH
+import html
+import re
+
+from feedparser import parse
+from telegram import Update, constants
+from telegram.constants import ParseMode
+from telegram.ext import CommandHandler
+
+from tg_bot import application
+from tg_bot.modules.helper_funcs.chat_status import user_admin
+from tg_bot.modules.sql import rss_sql as sql
+
+
+async def show_url(update: Update, context):
+    args = context.args
+    tg_chat_id = str(update.effective_chat.id)
+
+    if len(args) >= 1:
+        tg_feed_link = args[0]
+        link_processed = parse(tg_feed_link)
+
+        if link_processed.bozo == 0:
+            feed_title = link_processed.feed.get("title", default="Unknown")
+            feed_description = "<i>{}</i>".format(
+                re.sub('<[^<]+?>', '', link_processed.feed.get("description", default="Unknown")))
+            feed_link = link_processed.feed.get("link", default="Unknown")
+
+            feed_message = "<b>Feed Title:</b> \n{}" \
+                           "\n\n<b>Feed Description:</b> \n{}" \
+                           "\n\n<b>Feed Link:</b> \n{}".format(html.escape(feed_title),
+                                                               feed_description,
+                                                               html.escape(feed_link))
+
+            if len(link_processed.entries) >= 1:
+                entry_title = link_processed.entries[0].get("title", default="Unknown")
+                entry_description = "<i>{}</i>".format(
+                    re.sub('<[^<]+?>', '', link_processed.entries[0].get("description", default="Unknown")))
+                entry_link = link_processed.entries[0].get("link", default="Unknown")
+
+                entry_message = "\n\n<b>Entry Title:</b> \n{}" \
+                                "\n\n<b>Entry Description:</b> \n{}" \
+                                "\n\n<b>Entry Link:</b> \n{}".format(html.escape(entry_title),
+                                                                     entry_description,
+                                                                     html.escape(entry_link))
+                final_message = feed_message + entry_message
+
+                await context.bot.send_message(chat_id=tg_chat_id, text=final_message, parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(chat_id=tg_chat_id, text=feed_message, parse_mode=ParseMode.HTML)
+        else:
+            await update.effective_message.reply_text("This link is not an RSS Feed link")
+    else:
+        await update.effective_message.reply_text("URL missing")
+
+
+async def list_urls(update: Update, context):
+    tg_chat_id = str(update.effective_chat.id)
+
+    user_data = sql.get_urls(tg_chat_id)
+
+    links_list = [row.feed_link for row in user_data]
+
+    final_content = "\n\n".join(links_list)
+
+    if len(final_content) == 0:
+        await context.bot.send_message(chat_id=tg_chat_id, text="This chat is not subscribed to any links")
+    elif len(final_content) <= constants.MAX_MESSAGE_LENGTH:
+        await context.bot.send_message(chat_id=tg_chat_id, text="This chat is subscribed to the following links:\n" + final_content)
+    else:
+        await context.bot.send_message(chat_id=tg_chat_id, parse_mode=ParseMode.HTML,
+                                       text="<b>Warning:</b> The message is too long to be sent")
+
+
+@user_admin
+async def add_url(update: Update, context):
+    args = context.args
+    if len(args) >= 1:
+        chat = update.effective_chat
+
+        tg_chat_id = str(update.effective_chat.id)
+
+        tg_feed_link = args[0]
+
+        link_processed = parse(tg_feed_link)
+
+        if link_processed.bozo == 0:
+            if len(link_processed.entries[0]) >= 1:
+                tg_old_entry_link = link_processed.entries[0].link
+            else:
+                tg_old_entry_link = ""
+
+            row = sql.check_url_availability(tg_chat_id, tg_feed_link)
+
+            if row:
+                await update.effective_message.reply_text("This URL has already been added")
+            else:
+                sql.add_url(tg_chat_id, tg_feed_link, tg_old_entry_link)
+
+                await update.effective_message.reply_text("Added URL to subscription")
+        else:
+            await update.effective_message.reply_text("This link is not an RSS Feed link")
+    else:
+        await update.effective_message.reply_text("URL missing")
+
+
+@user_admin
+async def remove_url(update: Update, context):
+    args = context.args
+    if len(args) >= 1:
+        tg_chat_id = str(update.effective_chat.id)
+
+        tg_feed_link = args[0]
+
+        link_processed = parse(tg_feed_link)
+
+        if link_processed.bozo == 0:
+            user_data = sql.check_url_availability(tg_chat_id, tg_feed_link)
+
+            if user_data:
+                sql.remove_url(tg_chat_id, tg_feed_link)
+
+                await update.effective_message.reply_text("Removed URL from subscription")
+            else:
+                await update.effective_message.reply_text("You haven't subscribed to this URL yet")
+        else:
+            await update.effective_message.reply_text("This link is not an RSS Feed link")
+    else:
+        await update.effective_message.reply_text("URL missing")
+
+
+async def rss_update(context):
+    user_data = sql.get_all()
+
+    for row in user_data:
+        row_id = row.id
+        tg_chat_id = row.chat_id
+        tg_feed_link = row.feed_link
+
+        feed_processed = parse(tg_feed_link)
+
+        tg_old_entry_link = row.old_entry_link
+
+        new_entry_links = []
+        new_entry_titles = []
+
+        for entry in feed_processed.entries:
+            if entry.link != tg_old_entry_link:
+                new_entry_links.append(entry.link)
+                new_entry_titles.append(entry.title)
+            else:
+                break
+
+        if new_entry_links:
+            sql.update_url(row_id, new_entry_links)
+        else:
+            pass
+
+        if len(new_entry_links) < 5:
+            for link, title in zip(reversed(new_entry_links), reversed(new_entry_titles)):
+                final_message = "<b>{}</b>\n\n{}".format(html.escape(title), html.escape(link))
+
+                if len(final_message) <= constants.MAX_MESSAGE_LENGTH:
+                    await context.bot.send_message(chat_id=tg_chat_id, text=final_message, parse_mode=ParseMode.HTML)
+                else:
+                    await context.bot.send_message(chat_id=tg_chat_id, text="<b>Warning:</b> The message is too long to be sent",
+                                                   parse_mode=ParseMode.HTML)
+        else:
+            for link, title in zip(reversed(new_entry_links[-5:]), reversed(new_entry_titles[-5:])):
+                final_message = "<b>{}</b>\n\n{}".format(html.escape(title), html.escape(link))
+
+                if len(final_message) <= constants.MAX_MESSAGE_LENGTH:
+                    await context.bot.send_message(chat_id=tg_chat_id, text=final_message, parse_mode=ParseMode.HTML)
+                else:
+                    await context.bot.send_message(chat_id=tg_chat_id, text="<b>Warning:</b> The message is too long to be sent",
+                                                   parse_mode=ParseMode.HTML)
+
+            await context.bot.send_message(chat_id=tg_chat_id, parse_mode=ParseMode.HTML,
+                                           text="<b>Warning: </b>{} occurrences have been left out to prevent spam"
+                                           .format(len(new_entry_links) - 5))
+
+
+async def rss_set(context):
+    user_data = sql.get_all()
+
+    for row in user_data:
+        row_id = row.id
+        tg_feed_link = row.feed_link
+        tg_old_entry_link = row.old_entry_link
+
+        feed_processed = parse(tg_feed_link)
+
+        new_entry_links = []
+        new_entry_titles = []
+
+        for entry in feed_processed.entries:
+            if entry.link != tg_old_entry_link:
+                new_entry_links.append(entry.link)
+                new_entry_titles.append(entry.title)
+            else:
+                break
+
+        if new_entry_links:
+            sql.update_url(row_id, new_entry_links)
+        else:
+            pass
+
+
+__help__ = """
+ - /addrss <link>: add an RSS link to the subscriptions.
+ - /removerss <link>: removes the RSS link from the subscriptions.
+ - /rss <link>: shows the link's data and the last entry, for testing purposes.
+ - /listrss: shows the list of rss feeds that the chat is currently subscribed to.
+
+NOTE: In groups, only admins can add/remove RSS links to the group's subscription
+"""
+
+__mod_name__ = "RSS Feed"
+
+job = application.job_queue
+
+job_rss_set = job.run_once(rss_set, 5)
+job_rss_update = job.run_repeating(rss_update, interval=60, first=60)
+job_rss_set.enabled = True
+job_rss_update.enabled = True
+
+SHOW_URL_HANDLER = CommandHandler("rss", show_url)
+ADD_URL_HANDLER = CommandHandler("addrss", add_url)
+REMOVE_URL_HANDLER = CommandHandler("removerss", remove_url)
+LIST_URLS_HANDLER = CommandHandler("listrss", list_urls)
+
+application.add_handler(SHOW_URL_HANDLER)
+application.add_handler(ADD_URL_HANDLER)
+application.add_handler(REMOVE_URL_HANDLER)
+application.add_handler(LIST_URLS_HANDLER)
